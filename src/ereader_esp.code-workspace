@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../go/src/local/ereader_esp"
+		},
+		{
+			"name": "ESP32_Blink_Test",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}
