@@ -1,118 +1,175 @@
 #include <Arduino.h>
+#include <LittleFS.h>
 #include "epd4in26.h"
 #include "epdpaint.h"
 
 #define COLORED     0
 #define UNCOLORED   1
 
-// --- CONFIGURACIÓN DE BOTONES ---
-// (Conecta un lado del botón a estos pines y el otro a GND)
-#define BTN_UP      25
-#define BTN_DOWN    26
-#define BTN_SELECT  27
+// --- PINES SEGUROS ---
+#define BTN_UP      32
+#define BTN_DOWN    33
+#define BTN_SELECT  25
 
 Epd epd;
-#define BUFFER_SIZE (800 * 480 / 8)
+#define PAGE_SIZE 48000 // 800 * 480 / 8
+unsigned char* frame_buffer;
 
-// Variable para saber en qué opción estamos
-int opcionActual = 1; 
-int totalOpciones = 3;
-bool dibujarMenu = true; // Bandera para saber si hay que refrescar la pantalla
+enum Estado { MODO_MENU, MODO_LECTOR };
+Estado estadoActual = MODO_MENU;
+
+String libros[10];
+int totalLibros = 0;
+int seleccionMenu = 0;
+int paginaActual = 0;
+String libroAbierto = "";
+
+bool pantallaDormida = true;
+
+// --- FUNCIÓN DE ACTUALIZACIÓN BLINDADA ---
+
+void actualizarPantalla(bool dormirDespues) {
+  // Si vamos a dormir la pantalla o si estaba dormida, hacemos un ciclo completo
+  if (pantallaDormida || dormirDespues) {
+    Serial.println("Forzando Reset de Hardware e-Ink...");
+    // Esto asegura que el controlador salga de cualquier estado de error o bloqueo
+    epd.Reset(); 
+    
+    Serial.println("Inicializando registros...");
+    if (epd.Init() != 0) {
+      Serial.println("ERROR: No se pudo inicializar la pantalla.");
+      return;
+    }
+    pantallaDormida = false;
+  } else {
+    Serial.println("Refresco rápido (Pantalla ya activa).");
+  }
+  
+  Serial.println("Transfiriendo datos al panel...");
+  epd.Display(frame_buffer); 
+  
+  if (dormirDespues) { // No funciona dormir de momento
+    // Pequeño delay para asegurar que el comando Display fue procesado
+    delay(200); 
+    Serial.println("Comando Sleep enviado.");
+    epd.Sleep();
+    pantallaDormida = true;
+  }
+}
+
+// --- ARCHIVOS ---
+
+void listarLibros() {
+  Serial.println("--- Escaneando memoria interna ---");
+  totalLibros = 0;
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  while (file && totalLibros < 10) {
+    String nombre = file.name();
+    if (nombre.endsWith(".dat") || nombre.endsWith(".bin")) {
+      libros[totalLibros] = "/" + nombre;
+      Serial.print("Libro encontrado: ");
+      Serial.println(libros[totalLibros]);
+      totalLibros++;
+    }
+    file = root.openNextFile();
+  }
+  Serial.print("Total de libros: ");
+  Serial.println(totalLibros);
+}
+
+void cargarPagina(String path, int numPagina) {
+  Serial.printf("Cargando pág %d de %s\n", numPagina, path.c_str());
+  File file = LittleFS.open(path, "r");
+  if (!file) return;
+
+  long offset = (long)numPagina * PAGE_SIZE;
+  if (file.size() >= offset + PAGE_SIZE) {
+    file.seek(offset);
+    file.read(frame_buffer, PAGE_SIZE);
+  }
+  file.close();
+}
+
+// --- DIBUJO ---
+
+void dibujarMenu() {
+  Paint paint(frame_buffer, 800, 480);
+  paint.Clear(UNCOLORED);
+  paint.SetRotate(ROTATE_90);
+
+  paint.DrawStringAt(20, 20, "BIBLIOTECA", &Font24, COLORED);
+  paint.DrawLine(20, 50, 460, 50, COLORED);
+
+  if (totalLibros == 0) {
+    paint.DrawStringAt(20, 100, "No hay libros", &Font16, COLORED);
+  } else {
+    for (int i = 0; i < totalLibros; i++) {
+      int yPos = 80 + (i * 60);
+      if (i == seleccionMenu) {
+        paint.DrawFilledRectangle(20, yPos, 460, yPos + 40, COLORED);
+        paint.DrawStringAt(30, yPos + 10, libros[i].substring(1).c_str(), &Font16, UNCOLORED);
+      } else {
+        paint.DrawRectangle(20, yPos, 460, yPos + 40, COLORED);
+        paint.DrawStringAt(30, yPos + 10, libros[i].substring(1).c_str(), &Font16, COLORED);
+      }
+    }
+  }
+  actualizarPantalla(false); // Menú no se duerme para navegar rápido
+}
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  
-  Serial.println("Iniciando Seba-Reader...");
+  Serial.println("\n\nSeba-Reader OS Iniciado");
 
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
   pinMode(BTN_SELECT, INPUT_PULLUP);
 
-  if (epd.Init() != 0) {
-    Serial.println("Fallo al iniciar el módulo e-Paper.");
-    return;
-  }
-  
-  // ELIMINAMOS el epd.Clear() para que no choque con el menú
-  // El menú igual pintará el fondo blanco por su cuenta.
+  if (!LittleFS.begin(true)) return;
+  listarLibros();
+
+  frame_buffer = (unsigned char*)malloc(PAGE_SIZE);
+  dibujarMenu();
 }
 
 void loop() {
-  // ... (Tu código de lectura de botones queda igualito) ...
   if (digitalRead(BTN_DOWN) == LOW) {
-    opcionActual++;
-    if (opcionActual > totalOpciones) opcionActual = 1;
-    dibujarMenu = true;
-    Serial.println("Boton ABAJO presionado");
-    delay(400); 
+    if (estadoActual == MODO_MENU && totalLibros > 0) {
+      seleccionMenu = (seleccionMenu + 1) % totalLibros;
+      dibujarMenu();
+    } else if (estadoActual == MODO_LECTOR) {
+      paginaActual++;
+      cargarPagina(libroAbierto, paginaActual);
+      actualizarPantalla(true); 
+    }
+    delay(400);
   }
-  
+
   if (digitalRead(BTN_UP) == LOW) {
-    opcionActual--;
-    if (opcionActual < 1) opcionActual = totalOpciones;
-    dibujarMenu = true;
-    Serial.println("Boton ARRIBA presionado");
+    if (estadoActual == MODO_MENU && totalLibros > 0) {
+      seleccionMenu = (seleccionMenu - 1 + totalLibros) % totalLibros;
+      dibujarMenu();
+    } else if (estadoActual == MODO_LECTOR && paginaActual > 0) {
+      paginaActual--;
+      cargarPagina(libroAbierto, paginaActual);
+      actualizarPantalla(true); 
+    }
     delay(400);
   }
 
   if (digitalRead(BTN_SELECT) == LOW) {
-    Serial.print("Seleccionaste la opcion: ");
-    Serial.println(opcionActual);
+    if (estadoActual == MODO_MENU && totalLibros > 0) {
+      estadoActual = MODO_LECTOR;
+      libroAbierto = libros[seleccionMenu];
+      paginaActual = 0;
+      cargarPagina(libroAbierto, paginaActual);
+      actualizarPantalla(true); 
+    } else if (estadoActual == MODO_LECTOR) {
+      estadoActual = MODO_MENU;
+      dibujarMenu();
+    }
     delay(400);
-  }
-
-  // --- 2. DIBUJADO DE LA PANTALLA ---
-  if (dibujarMenu) {
-    Serial.println("Generando graficos en RAM...");
-    
-    unsigned char* frame_buffer = (unsigned char*)malloc(BUFFER_SIZE);
-    if (frame_buffer == NULL) {
-      Serial.println("Error: No hay suficiente RAM.");
-      return;
-    }
-    
-    // CORRECCIÓN CLAVE: Inicializamos con dimensiones físicas (800x480)
-    Paint paint(frame_buffer, 800, 480); 
-    paint.Clear(UNCOLORED); 
-    
-    // AHORA rotamos a vertical. La librería sola entenderá que ahora es 480x800
-    paint.SetRotate(ROTATE_90); 
-
-    // --- DISEÑO DEL MENÚ ---
-    paint.DrawStringAt(20, 30, "SEBA-READER", &Font24, COLORED);
-    paint.DrawLine(20, 60, 460, 60, COLORED); 
-
-    if (opcionActual == 1) {
-      paint.DrawFilledRectangle(20, 100, 460, 160, COLORED);
-      paint.DrawStringAt(30, 120, "> 1. Leer Libro", &Font24, UNCOLORED);
-    } else {
-      paint.DrawRectangle(20, 100, 460, 160, COLORED);
-      paint.DrawStringAt(30, 120, "  1. Leer Libro", &Font24, COLORED);
-    }
-
-    if (opcionActual == 2) {
-      paint.DrawFilledRectangle(20, 180, 460, 240, COLORED);
-      paint.DrawStringAt(30, 200, "> 2. Config", &Font24, UNCOLORED);
-    } else {
-      paint.DrawRectangle(20, 180, 460, 240, COLORED);
-      paint.DrawStringAt(30, 200, "  2. Config", &Font24, COLORED);
-    }
-
-    if (opcionActual == 3) {
-      paint.DrawFilledRectangle(20, 260, 460, 320, COLORED);
-      paint.DrawStringAt(30, 280, "> 3. Apagar", &Font24, UNCOLORED);
-    } else {
-      paint.DrawRectangle(20, 260, 460, 320, COLORED);
-      paint.DrawStringAt(30, 280, "  3. Apagar", &Font24, COLORED);
-    }
-
-    Serial.println("Actualizando panel de tinta...");
-    epd.Init(); 
-    epd.Display(frame_buffer);
-    epd.Sleep(); 
-
-    free(frame_buffer); 
-    dibujarMenu = false; 
   }
 }
